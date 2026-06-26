@@ -1,140 +1,55 @@
 // server.mjs
+import http from 'http';
+import httpProxy from 'http-proxy';
 
-import express from "express";
-import {
-  S3Client,
-  PutObjectCommand,
-  HeadObjectCommand,
-} from "@aws-sdk/client-s3";
+// Create a proxy server instance
+const proxy = httpProxy.createProxyServer({});
 
-const app = express();
-app.use(express.json());
-
-const ACCOUNT_ID = process.env.CF_ACCOUNT_ID;
-const BUCKET_NAME = process.env.R2_BUCKET_NAME;
-const ACCESS_KEY_ID = process.env.R2_ACCESS_KEY_ID;
-const SECRET_ACCESS_KEY = process.env.R2_SECRET_ACCESS_KEY;
-
-const s3 = new S3Client({
-  region: "auto",
-  endpoint: `https://${ACCOUNT_ID}.r2.cloudflarestorage.com`,
-  credentials: {
-    accessKeyId: ACCESS_KEY_ID,
-    secretAccessKey: SECRET_ACCESS_KEY,
-  },
+// Handle errors gracefully so the Render instance doesn't crash
+proxy.on('error', (err, req, res) => {
+  console.error('Proxy Error:', err);
+  if (!res.headersSent) {
+    res.writeHead(500, { 'Content-Type': 'text/plain' });
+  }
+  res.end('Proxy encountered an error routing your request.');
 });
 
-async function existsInR2(key) {
-  try {
-    await s3.send(
-      new HeadObjectCommand({
-        Bucket: BUCKET_NAME,
-        Key: key,
-      })
-    );
-    return true;
-  } catch {
-    return false;
+const server = http.createServer((req, res) => {
+  // CRITICAL FIX: Catch UptimeRobot / direct browser hits instantly to prevent 504/508 infinite loops
+  if (req.url === '/' || req.url === '/ping') {
+    res.writeHead(200, { 'Content-Type': 'text/plain' });
+    res.end('Proxy node is alive and healthy.');
+    return;
   }
-}
-
-app.post("/upload", async (req, res) => {
-  const { url } = req.body;
-
-  if (!url) {
-    return res.status(400).json({
-      error: "url required",
-    });
-  }
-
-  const key = url.replace("https://dl.subdl.com/", "");
-
-  console.log("Processing:", key);
 
   try {
-    // Check if already exists
-    if (await existsInR2(key)) {
-      console.log("Already exists:", key);
+    let target = req.url;
 
-      return res.json({
-        status: "exists",
-        key,
-      });
+    // If it's not an absolute URL, resolve it using the incoming request headers
+    if (!target.startsWith('http://') && !target.startsWith('https://')) {
+      const host = req.headers.host;
+      target = `https://${host}${req.url}`;
     }
 
-    // Download from SubDL
-    const response = await fetch(url, {
-      headers: {
-        Referer: "https://subdl.com",
-        "User-Agent":
-          "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
-      },
+    console.log(`[Proxying Request] -> ${req.method} ${target}`);
+
+    // Forward the payload out through this instance's unique IP address
+    proxy.web(req, res, {
+      target: target,
+      changeOrigin: true,
+      prependPath: false,
+      secure: true
     });
 
-    // Handle failed downloads
-    if (!response.ok) {
-      if (response.status === 429) {
-        console.log("=== 429 DETECTED ===");
-        console.log(
-          JSON.stringify(
-            Object.fromEntries(response.headers.entries()),
-            null,
-            2
-          )
-        );
-      }
-
-      console.error(
-        `Download failed: ${key} | Status: ${response.status}`
-      );
-
-      return res.status(500).json({
-        status: "failed",
-        key,
-        code: response.status,
-        headers: Object.fromEntries(response.headers.entries()),
-      });
-    }
-
-    // Convert response to buffer
-    const buffer = Buffer.from(await response.arrayBuffer());
-
-    // Upload to R2
-    await s3.send(
-      new PutObjectCommand({
-        Bucket: BUCKET_NAME,
-        Key: key,
-        Body: buffer,
-        ContentType: "application/zip",
-      })
-    );
-
-    console.log("Uploaded:", key);
-
-    return res.json({
-      status: "uploaded",
-      key,
-    });
-  } catch (err) {
-    console.error("Error:", key, err);
-
-    return res.status(500).json({
-      status: "error",
-      key,
-      error: err.message,
-    });
+  } catch (error) {
+    console.error('Server Processing Error:', error);
+    res.writeHead(500, { 'Content-Type': 'text/plain' });
+    res.end('Internal Proxy Server Error');
   }
 });
 
-app.get("/health", (_, res) => {
-  res.json({
-    ok: true,
-    timestamp: new Date().toISOString(),
-  });
-});
-
+// Bind explicitly to 0.0.0.0 so Render detects the open port flawlessly
 const PORT = process.env.PORT || 3000;
-
-app.listen(PORT, () => {
-  console.log(`Server running on port ${PORT}`);
+server.listen(PORT, '0.0.0.0', () => {
+  console.log(`Proxy server actively running on port ${PORT}`);
 });
